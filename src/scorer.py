@@ -21,14 +21,7 @@ import pandas as pd
 from .factors import technical as T
 from .factors import fundamental as F
 from .factors import fund_flow as FF
-
-
-def zscore(series: pd.Series) -> pd.Series:
-    """Cross-sectional z-score. Returns zeros if std = 0."""
-    std = series.std()
-    if std == 0 or np.isnan(std):
-        return pd.Series(0.0, index=series.index)
-    return (series - series.mean()) / std
+from .factors.utils import zscore
 
 
 def build_stock_factor_table(

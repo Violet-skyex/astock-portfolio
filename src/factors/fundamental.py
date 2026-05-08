@@ -67,7 +67,7 @@ def value_composite(df: pd.DataFrame) -> pd.Series:
     Equal-weighted combination of PE, PB, PS z-scores (all inverted).
     Returns a single value score — higher is cheaper.
     """
-    from ..scorer import zscore
+    from .utils import zscore
     z_pe = -zscore(pe_factor(df).dropna())
     z_pb = -zscore(pb_factor(df).dropna())
     z_ps = -zscore(ps_factor(df).dropna())
@@ -76,7 +76,7 @@ def value_composite(df: pd.DataFrame) -> pd.Series:
 
 def quality_composite(df: pd.DataFrame) -> pd.Series:
     """Equal-weighted ROE + gross margin - debt ratio."""
-    from ..scorer import zscore
+    from .utils import zscore
     z_roe    =  zscore(roe_factor(df).dropna())
     z_margin =  zscore(gross_margin_factor(df).dropna())
     z_debt   = -zscore(debt_ratio_factor(df).dropna())
@@ -85,7 +85,7 @@ def quality_composite(df: pd.DataFrame) -> pd.Series:
 
 def growth_composite(df: pd.DataFrame) -> pd.Series:
     """Equal-weighted revenue + profit growth."""
-    from ..scorer import zscore
+    from .utils import zscore
     z_rev    = zscore(revenue_growth_factor(df).dropna())
     z_profit = zscore(profit_growth_factor(df).dropna())
     return (z_rev + z_profit).reindex(df.index) / 2

@@ -12,7 +12,7 @@ from __future__ import annotations
 
 import pandas as pd
 
-from ..scorer import zscore
+from .utils import zscore
 
 
 def north_money_factor(fund_flow_df: pd.DataFrame) -> pd.Series:

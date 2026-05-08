@@ -29,7 +29,7 @@ from .factors.technical import (
     momentum_1m, momentum_3m, momentum_6m,
     volatility_20d, avg_turnover_20d, volume_ratio,
 )
-from .scorer import zscore
+from .factors.utils import zscore
 from .optimizer import build_portfolio, _cap_and_renorm
 
 RebalFreq = Literal["daily", "weekly", "biweekly", "monthly"]
