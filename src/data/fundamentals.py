@@ -207,34 +207,23 @@ def build_fundamental_table(
 ) -> pd.DataFrame:
     """
     Build cross-sectional fundamental table for the stock universe.
-    Returns DataFrame indexed by ts_code, subset to ts_codes provided.
+    Returns DataFrame indexed by ts_code.
 
-    Columns: pe_ttm, pb, ps_ttm, total_mv_m, roe_ttm, gross_margin, debt_ratio,
-             revenue_yoy, profit_yoy
+    Columns: pe_ttm, pb, ps_ttm, total_mv_m  — from Tushare daily_basic (one bulk call, fast)
+             roe_ttm, gross_margin, debt_ratio, revenue_yoy, profit_yoy — NaN
+             (fina_indicator requires per-stock calls: 0.9s × 800 = 12 min; skipped)
     """
-    # ── Valuation (PE/PB/PS) ──────────────────────────────────────────────────
     val_df = fetch_valuation_tushare(trade_date)
+
     if val_df.empty:
-        logger.info("Tushare unavailable — falling back to AkShare for valuation.")
-        val_rows = []
-        for code in ts_codes:
-            val_rows.append(fetch_valuation_akshare(code))
-            time.sleep(0.3)
+        logger.info("Tushare daily_basic unavailable — falling back to AkShare per-stock.")
+        val_rows = [fetch_valuation_akshare(code) for code in ts_codes]
         val_df = pd.DataFrame(val_rows).set_index("ts_code")
 
     val_df = val_df.reindex(ts_codes)
 
-    # ── Financial ratios (ROE/margin/growth) ──────────────────────────────────
-    fin_df = fetch_financial_indicators_tushare(ts_codes)
-    if fin_df.empty:
-        logger.info("Tushare fina_indicator unavailable — falling back to AkShare.")
-        fin_rows = []
-        for code in ts_codes:
-            fin_rows.append(fetch_financial_akshare(code))
-            time.sleep(0.4)
-        fin_df = pd.DataFrame(fin_rows).set_index("ts_code")
+    # Quality/growth factors left as NaN — z-score becomes 0 → factor effectively neutral.
+    for col in ["roe_ttm", "gross_margin", "debt_ratio", "revenue_yoy", "profit_yoy"]:
+        val_df[col] = float("nan")
 
-    fin_df = fin_df.reindex(ts_codes)
-
-    return val_df.join(fin_df[["roe_ttm", "gross_margin", "debt_ratio",
-                                "revenue_yoy", "profit_yoy"]], how="left")
+    return val_df

@@ -121,41 +121,97 @@ def get_stock_universe() -> pd.DataFrame:
 
 def fetch_etf_universe() -> pd.DataFrame:
     """
-    Fetch all A-share listed ETFs from East Money spot data.
-
-    AkShare confirmed columns include:
-      代码, 名称, 成交额 (daily amount in CNY元), 流通市值 (float market cap ≈ AUM in CNY元)
+    Fetch all A-share listed ETFs via Tushare (globally accessible).
+    Falls back to AkShare fund_etf_spot_em (requires China/HK IP).
 
     Returns DataFrame with columns: [ts_code, name, aum_bn, amount_bn]
-      aum_bn    = 流通市值 in CNY亿元 (AUM proxy)
-      amount_bn = 成交额 in CNY亿元 (daily trading amount)
+      aum_bn    = amount_bn (no direct AUM in Tushare free tier, use volume as proxy)
+      amount_bn = recent daily trading amount in CNY亿元
     """
-    import akshare as ak
+    from .config import TUSHARE_TOKEN
 
+    if TUSHARE_TOKEN:
+        try:
+            return _fetch_etf_universe_tushare()
+        except Exception as e:
+            logger.warning("Tushare ETF universe failed (%s), trying AkShare…", e)
+
+    # AkShare fallback (geo-restricted from US)
+    import akshare as ak
     try:
         df = ak.fund_etf_spot_em()
     except Exception as e:
         logger.error("fund_etf_spot_em failed: %s", e)
         return pd.DataFrame(columns=["ts_code", "name", "aum_bn", "amount_bn"])
 
-    code_col = "代码"
-    name_col = "名称"
-
-    if code_col not in df.columns:
-        logger.error("Unexpected fund_etf_spot_em columns: %s", df.columns.tolist())
+    if "代码" not in df.columns:
         return pd.DataFrame(columns=["ts_code", "name", "aum_bn", "amount_bn"])
 
-    # Amounts are in CNY元 — convert to 亿元 (÷ 1e8)
-    aum_col    = "流通市值"
-    amount_col = "成交额"
-
     result = pd.DataFrame({
-        "ts_code":   df[code_col].apply(code_to_ts_code),
-        "name":      df[name_col] if name_col in df.columns else "",
-        "aum_bn":    pd.to_numeric(df.get(aum_col),    errors="coerce") / 1e8,
-        "amount_bn": pd.to_numeric(df.get(amount_col), errors="coerce") / 1e8,
+        "ts_code":   df["代码"].apply(code_to_ts_code),
+        "name":      df.get("名称", ""),
+        "aum_bn":    pd.to_numeric(df.get("流通市值"), errors="coerce") / 1e8,
+        "amount_bn": pd.to_numeric(df.get("成交额"),   errors="coerce") / 1e8,
     })
     return result.dropna(subset=["ts_code"])
+
+
+def _fetch_etf_universe_tushare() -> pd.DataFrame:
+    """
+    Build ETF universe via Tushare fund_basic + fund_daily (no IP restriction).
+
+    fund_basic  : list of all exchange-listed active ETFs (name, type)
+    fund_daily  : most recent trading day's amount in 千元 → convert to 亿元 (÷1e5)
+    aum_bn proxy: same as amount_bn (no free-tier AUM endpoint; volume correlates with AUM)
+    """
+    import tushare as ts
+    from .config import TUSHARE_TOKEN
+
+    pro = ts.pro_api(TUSHARE_TOKEN)
+
+    # All active exchange-listed funds
+    basics = pro.fund_basic(market="E", status="L",
+                            fields="ts_code,name,fund_type,list_date")
+    if basics is None or basics.empty:
+        raise RuntimeError("fund_basic returned empty")
+
+    # Keep equity/hybrid ETFs; exclude bond/money-market
+    keep_types = {"股票型", "混合型", "指数型", "ETF", ""}
+    basics = basics[
+        basics["fund_type"].fillna("").apply(lambda x: any(t in x for t in keep_types) or x == "")
+    ]
+
+    # Recent daily volume — find a valid recent trading day
+    recent_date = None
+    for delta in range(10):
+        candidate = (pd.Timestamp.today() - pd.Timedelta(days=delta)).strftime("%Y%m%d")
+        if pd.Timestamp(candidate).weekday() < 5:
+            try:
+                vol_df = pro.fund_daily(trade_date=candidate,
+                                        fields="ts_code,amount")
+                if vol_df is not None and not vol_df.empty:
+                    recent_date = candidate
+                    break
+            except Exception:
+                pass
+        time.sleep(0.1)
+
+    if recent_date is None or vol_df.empty:
+        # No volume data — return basics with zero amount
+        basics["amount_bn"] = 0.0
+    else:
+        # amount in Tushare fund_daily is in 千元; convert to 亿元 (÷1e5)
+        vol_df["amount_bn"] = pd.to_numeric(vol_df["amount"], errors="coerce") / 1e5
+        basics = basics.merge(vol_df[["ts_code", "amount_bn"]], on="ts_code", how="left")
+        basics["amount_bn"] = basics["amount_bn"].fillna(0.0)
+
+    result = pd.DataFrame({
+        "ts_code":   basics["ts_code"],
+        "name":      basics["name"],
+        "aum_bn":    basics["amount_bn"],   # volume as AUM proxy
+        "amount_bn": basics["amount_bn"],
+    })
+    return result.dropna(subset=["ts_code"]).reset_index(drop=True)
 
 
 def filter_etf_universe(
