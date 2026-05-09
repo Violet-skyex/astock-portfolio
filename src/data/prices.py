@@ -372,10 +372,10 @@ def fetch_prices_tushare(
 
     prices = prices.ffill(limit=5)
 
-    if not is_etf:
-        turnover = _fetch_turnover_tushare(ts_codes, start_date, end_date, pro, prices.index)
-    else:
-        turnover = pd.DataFrame(0.0, index=prices.index, columns=prices.columns)
+    # Turnover via daily_basic bulk would fetch ALL ~5000 A-shares (no ts_code filter
+    # in Tushare bulk mode), causing multi-minute hangs. Skip it; scorer handles
+    # zero turnover gracefully (liquidity factor = 0 instead of computed score).
+    turnover = pd.DataFrame(0.0, index=prices.index, columns=prices.columns)
 
     return prices, volume, amount, turnover
 
