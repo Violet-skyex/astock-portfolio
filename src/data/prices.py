@@ -1,9 +1,10 @@
 """
 Daily price and volume data for A-share stocks and ETFs.
 
-Data source routing (auto):
-  Tushare Pro   — globally accessible; used when TUSHARE_TOKEN is set (stocks only)
-  AkShare       — fallback; stock_zh_a_hist requires China/HK IP (East Money geo-restriction)
+Data source routing (fetch_prices_auto):
+  1. yfinance  — primary; free, no API key, globally accessible.
+                 A-share symbol mapping: 600519.SH → 600519.SS, 000858.SZ → 000858.SZ
+  2. AkShare   — fallback (China/HK IP only); stock_zh_a_hist is East Money geo-restricted.
 
 AkShare confirmed column names:
   stock_zh_a_hist    → 日期, 股票代码, 开盘, 收盘, 最高, 最低, 成交量, 成交额, 振幅, 涨跌幅, 涨跌额, 换手率
@@ -380,6 +381,77 @@ def fetch_prices_tushare(
     return prices, volume, amount, turnover
 
 
+# ── yfinance price fetching (primary, global, free) ───────────────────────────
+
+def _ts_to_yf(ts_code: str) -> str:
+    """Convert ts_code to yfinance symbol: 600519.SH → 600519.SS, 000858.SZ → 000858.SZ"""
+    code, exch = ts_code.split(".")
+    return f"{code}.{'SS' if exch == 'SH' else 'SZ'}"
+
+
+def fetch_prices_yfinance(
+    ts_codes: list[str],
+    start_date: str,
+    end_date: str,
+    progress_callback=None,
+) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+    """
+    Batch download via yfinance (Yahoo Finance).
+    Free, no API key, globally accessible. Covers all A-share stocks and ETFs.
+    Returns (prices, volume, amount=empty, turnover=zeros).
+    """
+    import yfinance as yf
+
+    yf_syms  = [_ts_to_yf(c) for c in ts_codes]
+    sym_map  = {_ts_to_yf(c): c for c in ts_codes}   # yf_sym → ts_code
+
+    if progress_callback:
+        progress_callback(0, 1)
+
+    try:
+        raw = yf.download(
+            yf_syms,
+            start=start_date,
+            end=end_date,
+            auto_adjust=True,
+            progress=False,
+            threads=True,
+        )
+    except Exception as e:
+        logger.error("yfinance download failed: %s", e)
+        empty = pd.DataFrame()
+        return empty, empty, empty, empty
+
+    if progress_callback:
+        progress_callback(1, 1)
+
+    if raw.empty:
+        empty = pd.DataFrame()
+        return empty, empty, empty, empty
+
+    # MultiIndex columns: (field, yf_sym) when multiple tickers
+    if isinstance(raw.columns, pd.MultiIndex):
+        close_df  = raw["Close"].rename(columns=sym_map)
+        volume_df = raw["Volume"].rename(columns=sym_map)
+    else:
+        # Single ticker — flat columns
+        single = ts_codes[0]
+        close_df  = raw[["Close"]].rename(columns={"Close": single})
+        volume_df = raw[["Volume"]].rename(columns={"Volume": single})
+
+    close_df  = close_df.sort_index().ffill(limit=5)
+    volume_df = volume_df.sort_index()
+
+    # Drop columns that are entirely NaN (yfinance couldn't find the symbol)
+    close_df  = close_df.dropna(axis=1, how="all")
+    volume_df = volume_df.reindex(columns=close_df.columns).fillna(0)
+
+    amount_df   = pd.DataFrame(index=close_df.index)
+    turnover_df = pd.DataFrame(0.0, index=close_df.index, columns=close_df.columns)
+
+    return close_df, volume_df, amount_df, turnover_df
+
+
 def fetch_prices_auto(
     ts_codes: list[str],
     start_date: str,
@@ -392,23 +464,20 @@ def fetch_prices_auto(
     """
     Auto-routing price fetcher.
 
-    Tries Tushare Pro first (works from any IP, stocks + ETFs).
-    Falls back to AkShare only when TUSHARE_TOKEN is not set
-    (AkShare stock_zh_a_hist requires China/HK IP).
+    Primary : yfinance — free, global, no API key required.
+    Fallback : AkShare — requires China/HK IP (East Money geo-restriction).
     """
-    from ..config import TUSHARE_TOKEN
-
-    if TUSHARE_TOKEN:
-        try:
-            logger.info("Fetching %s prices via Tushare bulk (%d tickers)…",
-                        "ETF" if is_etf else "stock", len(ts_codes))
-            return fetch_prices_tushare(
-                ts_codes, start_date, end_date,
-                is_etf=is_etf,
-                progress_callback=progress_callback,
-            )
-        except Exception as e:
-            logger.warning("Tushare bulk fetch failed, falling back to AkShare: %s", e)
+    try:
+        logger.info("Fetching %s prices via yfinance (%d tickers)…",
+                    "ETF" if is_etf else "stock", len(ts_codes))
+        result = fetch_prices_yfinance(ts_codes, start_date, end_date,
+                                       progress_callback=progress_callback)
+        prices = result[0]
+        if not prices.empty:
+            return result
+        logger.warning("yfinance returned empty data, falling back to AkShare")
+    except Exception as e:
+        logger.warning("yfinance failed (%s), falling back to AkShare", e)
 
     return fetch_prices_batch(
         ts_codes, start_date, end_date,
@@ -435,10 +504,30 @@ def fetch_index_daily(
     Fetch daily close for a benchmark index.
     index_code format: '000300.SH' or '000905.SH'
 
-    AkShare symbol format: 'sh000300' (Shanghai) or 'sz000905' (Shenzhen).
-    Returns Series indexed by datetime, named with index_code.
+    Tries yfinance first (global) using Yahoo Finance index symbols,
+    falls back to AkShare stock_zh_index_daily (China/HK IP required).
+
+    Yahoo Finance index symbols:
+      000300.SH (沪深300) → 000300.SS
+      000905.SH (中证500) → 000905.SS
+      000016.SH (上证50)  → 000016.SS
     """
-    sym = index_code.split(".")[0]
+    import yfinance as yf
+
+    yf_sym = _ts_to_yf(index_code)
+    try:
+        raw = yf.download(yf_sym, start=start_date, end=end_date,
+                          auto_adjust=True, progress=False)
+        if not raw.empty:
+            close = raw["Close"]
+            if isinstance(close, pd.DataFrame):
+                close = close.iloc[:, 0]
+            return close.rename(index_code)
+    except Exception as e:
+        logger.warning("yfinance index fetch failed for %s: %s — trying AkShare", index_code, e)
+
+    # AkShare fallback
+    sym    = index_code.split(".")[0]
     prefix = "sh" if index_code.endswith(".SH") else "sz"
     ak_sym = f"{prefix}{sym}"
 
@@ -448,7 +537,6 @@ def fetch_index_daily(
         logger.error("stock_zh_index_daily failed for %s: %s", ak_sym, e)
         return pd.Series(dtype=float, name=index_code)
 
-    # English column names: date, open, high, low, close, volume
     if "date" not in df.columns or "close" not in df.columns:
         logger.error("Unexpected index_daily columns: %s", df.columns.tolist())
         return pd.Series(dtype=float, name=index_code)
@@ -456,7 +544,5 @@ def fetch_index_daily(
     df["date"] = pd.to_datetime(df["date"])
     df = df.set_index("date")
     close = pd.to_numeric(df["close"], errors="coerce").rename(index_code)
-
-    # Slice to requested date range
-    mask = (close.index >= pd.to_datetime(start_date)) & (close.index <= pd.to_datetime(end_date))
+    mask  = (close.index >= pd.to_datetime(start_date)) & (close.index <= pd.to_datetime(end_date))
     return close[mask]
