@@ -294,58 +294,88 @@ def fetch_prices_tushare(
     ts_codes: list[str],
     start_date: str,
     end_date: str,
-    max_workers: int = 5,
+    is_etf: bool = False,
     progress_callback=None,
+    batch_size: int = 100,
 ) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame]:
     """
-    Fetch price/volume data via Tushare Pro (globally accessible, no IP restriction).
+    Bulk quarterly batch fetch via Tushare Pro (globally accessible).
 
-    Returns (prices, volume, amount, turnover) — same shape as fetch_prices_batch.
-    Requires TUSHARE_TOKEN to be set in config.
+    Sends batches of `batch_size` codes per quarterly date chunk, so 800 stocks
+    over 1 year = ~32 API calls instead of 800 individual calls.
+    Works for both stocks (pro.daily) and ETFs (pro.fund_daily).
     """
     import tushare as ts
     from ..config import TUSHARE_TOKEN
 
     if not TUSHARE_TOKEN:
-        raise ValueError("TUSHARE_TOKEN not configured — cannot use Tushare price source")
+        raise ValueError("TUSHARE_TOKEN not configured")
 
     pro = ts.pro_api(TUSHARE_TOKEN)
-    frames: dict[str, pd.DataFrame] = {}
-    total = len(ts_codes)
-    done = 0
+    api_fn   = pro.fund_daily if is_etf else pro.daily
+    fields   = "ts_code,trade_date,close,vol,amount"
+    ts_set   = set(ts_codes)
 
-    def _worker(code: str) -> tuple[str, pd.DataFrame | None]:
-        time.sleep(0.2)
-        return code, _fetch_one_stock_tushare(code, start_date, end_date, pro)
+    date_chunks  = _quarterly_chunks(start_date, end_date)
+    code_batches = [ts_codes[i : i + batch_size] for i in range(0, len(ts_codes), batch_size)]
+    total_calls  = len(code_batches) * len(date_chunks)
+    done         = 0
 
-    with ThreadPoolExecutor(max_workers=max_workers) as pool:
-        futures = {pool.submit(_worker, code): code for code in ts_codes}
-        for fut in as_completed(futures):
-            code, result = fut.result()
-            if result is not None:
-                frames[code] = result
+    daily_parts: list[pd.DataFrame] = []
+
+    for sd, ed in date_chunks:
+        for batch in code_batches:
+            batch_str = ",".join(batch)
+            for attempt in range(3):
+                try:
+                    df = api_fn(ts_code=batch_str, start_date=sd, end_date=ed, fields=fields)
+                    if df is not None and not df.empty:
+                        daily_parts.append(df)
+                    break
+                except Exception as e:
+                    if attempt < 2:
+                        time.sleep(2.0 * (attempt + 1))
+                    else:
+                        logger.warning(
+                            "Tushare batch failed (%s…%s %s-%s): %s",
+                            batch[0], batch[-1], sd, ed, e,
+                        )
             done += 1
             if progress_callback:
-                progress_callback(done, total)
+                progress_callback(done, total_calls)
+            time.sleep(0.35)   # stay within free-tier rate limit
 
-    if not frames:
+    if not daily_parts:
         empty = pd.DataFrame()
         return empty, empty, empty, empty
 
-    combined = pd.concat(frames.values(), axis=1).sort_index()
+    raw = pd.concat(daily_parts, ignore_index=True)
+    raw = raw[raw["ts_code"].isin(ts_set)].copy()
+    raw["trade_date"] = pd.to_datetime(raw["trade_date"])
+    for col in ["close", "vol", "amount"]:
+        if col in raw.columns:
+            raw[col] = pd.to_numeric(raw[col], errors="coerce")
 
-    def _extract(field: str) -> pd.DataFrame:
-        try:
-            return combined.xs(field, axis=1, level=1)
-        except KeyError:
-            return pd.DataFrame(index=combined.index)
+    def _pivot(col: str) -> pd.DataFrame:
+        if col not in raw.columns:
+            return pd.DataFrame()
+        return raw.pivot_table(index="trade_date", columns="ts_code",
+                               values=col, aggfunc="last")
 
-    prices = _extract("close")
-    volume = _extract("vol")
-    amount = _extract("amount")
+    prices = _pivot("close").sort_index()
+    volume = _pivot("vol").sort_index()
+    amount = _pivot("amount").sort_index()
+
+    if prices.empty:
+        empty = pd.DataFrame()
+        return empty, empty, empty, empty
+
     prices = prices.ffill(limit=5)
 
-    turnover = _fetch_turnover_tushare(ts_codes, start_date, end_date, pro, prices.index)
+    if not is_etf:
+        turnover = _fetch_turnover_tushare(ts_codes, start_date, end_date, pro, prices.index)
+    else:
+        turnover = pd.DataFrame(0.0, index=prices.index, columns=prices.columns)
 
     return prices, volume, amount, turnover
 
@@ -362,22 +392,23 @@ def fetch_prices_auto(
     """
     Auto-routing price fetcher.
 
-    For stocks: tries Tushare Pro first (works globally), falls back to AkShare
-                (requires China/HK IP).
-    For ETFs  : uses AkShare fund_etf_hist_em directly (Tushare fund_daily less reliable).
+    Tries Tushare Pro first (works from any IP, stocks + ETFs).
+    Falls back to AkShare only when TUSHARE_TOKEN is not set
+    (AkShare stock_zh_a_hist requires China/HK IP).
     """
     from ..config import TUSHARE_TOKEN
 
-    if not is_etf and TUSHARE_TOKEN:
+    if TUSHARE_TOKEN:
         try:
-            logger.info("Fetching prices via Tushare Pro (%d tickers)…", len(ts_codes))
+            logger.info("Fetching %s prices via Tushare bulk (%d tickers)…",
+                        "ETF" if is_etf else "stock", len(ts_codes))
             return fetch_prices_tushare(
                 ts_codes, start_date, end_date,
-                max_workers=min(max_workers, 5),
+                is_etf=is_etf,
                 progress_callback=progress_callback,
             )
         except Exception as e:
-            logger.warning("Tushare fetch failed, falling back to AkShare: %s", e)
+            logger.warning("Tushare bulk fetch failed, falling back to AkShare: %s", e)
 
     return fetch_prices_batch(
         ts_codes, start_date, end_date,
