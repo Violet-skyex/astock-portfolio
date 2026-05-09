@@ -176,7 +176,9 @@ def _walk_forward(
                         **optimizer_kwargs,
                     )
                     new_weights = new_port["Weight"] if not new_port.empty else pd.Series(dtype=float)
-                except Exception:
+                except Exception as exc:
+                    import logging as _log
+                    _log.getLogger(__name__).warning("build_portfolio failed at %s: %s", date, exc)
                     new_weights = current_weights.copy()
             else:
                 new_weights = current_weights.copy()
@@ -252,7 +254,7 @@ def run_stock_backtest(
     """
     factor_kw    = dict(w_mom_1m=w_mom_1m, w_mom_3m=w_mom_3m, w_mom_6m=w_mom_6m,
                         w_vol=w_vol, w_liq=w_liq)
-    optimizer_kw = dict(max_positions=max_positions)
+    optimizer_kw = {}
     return _walk_forward(prices, volume, turnover, returns, benchmark,
                          freq, lookback_days, max_positions, mode,
                          factor_kw, optimizer_kw)
@@ -275,7 +277,7 @@ def run_etf_backtest(
     """
     factor_kw    = dict(w_mom_1m=0.05, w_mom_3m=0.45, w_mom_6m=0.35,
                         w_vol=0.10, w_liq=0.05)
-    optimizer_kw = dict(max_positions=max_positions)
+    optimizer_kw = {}
     return _walk_forward(prices, volume, turnover, returns, benchmark,
                          freq, lookback_days, max_positions, mode,
                          factor_kw, optimizer_kw)
