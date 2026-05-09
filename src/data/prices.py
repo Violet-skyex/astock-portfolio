@@ -467,13 +467,29 @@ def fetch_prices_auto(
     Primary : yfinance — free, global, no API key required.
     Fallback : AkShare — requires China/HK IP (East Money geo-restriction).
     """
+    from ..config import TUSHARE_TOKEN
+
+    # Stocks: Tushare bulk quarterly (globally accessible, has amount + vol)
+    # ETFs  : yfinance (Tushare fund_daily batch is broken)
+    if not is_etf and TUSHARE_TOKEN:
+        try:
+            logger.info("Fetching stock prices via Tushare bulk (%d tickers)…", len(ts_codes))
+            result = fetch_prices_tushare(ts_codes, start_date, end_date,
+                                          is_etf=False,
+                                          progress_callback=progress_callback)
+            if not result[0].empty:
+                return result
+            logger.warning("Tushare returned empty prices, falling back to yfinance")
+        except Exception as e:
+            logger.warning("Tushare prices failed (%s), falling back to yfinance", e)
+
+    # ETFs or Tushare fallback: yfinance
     try:
         logger.info("Fetching %s prices via yfinance (%d tickers)…",
                     "ETF" if is_etf else "stock", len(ts_codes))
         result = fetch_prices_yfinance(ts_codes, start_date, end_date,
                                        progress_callback=progress_callback)
-        prices = result[0]
-        if not prices.empty:
+        if not result[0].empty:
             return result
         logger.warning("yfinance returned empty data, falling back to AkShare")
     except Exception as e:

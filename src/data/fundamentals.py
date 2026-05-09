@@ -56,8 +56,18 @@ def fetch_valuation_tushare(trade_date: str | None = None) -> pd.DataFrame:
         return pd.DataFrame()
 
     fields = "ts_code,trade_date,pe_ttm,pb,ps_ttm,total_mv"
+
+    # Resolve trade_date: if not provided, try recent weekdays until we get data
+    if not trade_date:
+        today = pd.Timestamp.today()
+        for delta in range(7):
+            candidate = (today - pd.Timedelta(days=delta)).strftime("%Y%m%d")
+            if pd.Timestamp(candidate).weekday() < 5:   # Mon–Fri
+                trade_date = candidate
+                break
+
     try:
-        df = pro.daily_basic(trade_date=trade_date or "", fields=fields)
+        df = pro.daily_basic(trade_date=trade_date, fields=fields)
     except Exception as e:
         logger.error("Tushare daily_basic failed: %s", e)
         return pd.DataFrame()
@@ -65,15 +75,19 @@ def fetch_valuation_tushare(trade_date: str | None = None) -> pd.DataFrame:
     if df is None or df.empty:
         return pd.DataFrame()
 
+    # Keep only the single latest date (guard against multi-date responses)
+    if "trade_date" in df.columns:
+        df = df[df["trade_date"] == df["trade_date"].max()]
+
     df = df.rename(columns={"total_mv": "total_mv_m"})
     df = df[["ts_code", "pe_ttm", "pb", "ps_ttm", "total_mv_m"]].copy()
     for col in ["pe_ttm", "pb", "ps_ttm", "total_mv_m"]:
         df[col] = pd.to_numeric(df[col], errors="coerce")
 
-    # Drop obviously bad values (negative PE for stocks without earnings)
     df.loc[df["pe_ttm"] < 0, "pe_ttm"] = float("nan")
 
-    return df.set_index("ts_code")
+    result = df.set_index("ts_code")
+    return result[~result.index.duplicated(keep="last")]
 
 
 def fetch_financial_indicators_tushare(
